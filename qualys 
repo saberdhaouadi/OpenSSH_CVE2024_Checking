@@ -1,0 +1,145 @@
+import xml.etree.ElementTree as ET
+import requests
+import json
+from datetime import datetime, timedelta
+import base64
+import getpass
+
+# Jira configuration
+JIRA_URL = "https://your-domain.atlassian.net"  # Replace with your Jira instance URL
+JIRA_PROJECT_KEY = "YOUR_PROJECT_KEY"  # Replace with your Jira project key
+JIRA_ISSUE_TYPE = "Task"  # Adjust based on your issue type (e.g., Bug, Task)
+JIRA_API_TOKEN = getpass.getpass("Enter your Jira API token: ")  # Securely input API token
+JIRA_USERNAME = "your.email@example.com"  # Replace with your Jira email
+
+# Qualys XML report path
+QUALYS_REPORT_PATH = "path/to/your/qualys_report.xml"  # Replace with your XML file path
+
+# Due date and priority mapping based on CVSS score
+CVSS_DUE_DAYS = {
+    8: {"days": 15, "priority": "Highest"},
+    6: {"days": 30, "priority": "High"},
+    4: {"days": 45, "priority": "Medium"},
+    2: {"days": 60, "priority": "Low"},
+    1: {"days": 90, "priority": "Lowest"}
+}
+
+def get_jira_auth_headers():
+    """Generate headers for Jira API authentication."""
+    auth_string = f"{JIRA_USERNAME}:{JIRA_API_TOKEN}"
+    auth_encoded = base64.b64encode(auth_string.encode()).decode()
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {auth_encoded}"
+    }
+
+def check_duplicate_issue(summary):
+    """Check if an issue with the same summary already exists."""
+    jql = f'project = {JIRA_PROJECT_KEY} AND summary ~ "{summary}"'
+    url = f"{JIRA_URL}/rest/api/2/search"
+    params = {"jql": jql}
+    try:
+        response = requests.get(url, headers=get_jira_auth_headers(), params=params)
+        response.raise_for_status()
+        issues = response.json().get("issues", [])
+        return len(issues) > 0
+    except requests.RequestException as e:
+        print(f"Error checking for duplicates: {e}")
+        return False
+
+def create_jira_issue(vuln_data):
+    """Create a Jira issue with vulnerability data."""
+    url = f"{JIRA_URL}/rest/api/2/issue"
+    summary = f"Qualys Vulnerability: {vuln_data['title']} (QID: {vuln_data['qid']})"
+    
+    # Skip if duplicate issue exists
+    if check_duplicate_issue(summary):
+        print(f"Skipping duplicate issue: {summary}")
+        return
+
+    # Calculate due date based on CVSS score
+    cvss_base = float(vuln_data.get("cvss_base", 1))
+    due_days = 90  # Default
+    priority = "Lowest"  # Default
+    for threshold, config in CVSS_DUE_DAYS.items():
+        if cvss_base >= threshold:
+            due_days = config["days"]
+            priority = config["priority"]
+            break
+    
+    due_date = (datetime.now() + timedelta(days=due_days)).strftime("%Y-%m-%d")
+
+    # Construct issue payload
+    payload = {
+        "fields": {
+            "project": {"key": JIRA_PROJECT_KEY},
+            "issuetype": {"name": JIRA_ISSUE_TYPE},
+            "summary": summary,
+            "description": (
+                f"*QID*: {vuln_data['qid']}\n"
+                f"*Severity*: {vuln_data['severity']}\n"
+                f"*CVSS Base*: {vuln_data.get('cvss_base', 'N/A')}\n"
+                f"*First Detected*: {vuln_data.get('first_detected', 'N/A')}\n"
+                f"*Last Detected*: {vuln_data.get('last_detected', 'N/A')}\n"
+                f"*Threat*: {vuln_data.get('threat', 'N/A')}\n"
+                f"*Impact*: {vuln_data.get('impact', 'N/A')}\n"
+                f"*Solution*: {vuln_data.get('solution', 'N/A')}\n"
+            ),
+            "priority": {"name": priority},
+            "duedate": due_date,
+            # Add custom fields if required (replace customfield_XXXXX with your field IDs)
+            # "customfield_10200": vuln_data.get("cve_id", ""),
+        }
+    }
+
+    try:
+        response = requests.post(url, headers=get_jira_auth_headers(), data=json.dumps(payload))
+        response.raise_for_status()
+        issue_key = response.json().get("key")
+        print(f"Created Jira issue: {issue_key}")
+    except requests.RequestException as e:
+        print(f"Failed to create issue for QID {vuln_data['qid']}: {e}")
+
+def parse_qualys_report(xml_path):
+    """Parse Qualys XML report and extract vulnerability data."""
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        vulnerabilities = []
+
+        # Adjust the XML path based on your Qualys report structure
+        for vuln in root.findall(".//VULN"):
+            vuln_data = {
+                "qid": vuln.get("QID", "N/A"),
+                "title": vuln.findtext("TITLE", "Unknown Vulnerability"),
+                "severity": vuln.findtext("SEVERITY", "N/A"),
+                "cvss_base": vuln.findtext("CVSS_BASE", "1"),
+                "first_detected": vuln.findtext("FIRST_DETECTED", "N/A"),
+                "last_detected": vuln.findtext("LAST_DETECTED", "N/A"),
+                "threat": vuln.findtext("THREAT", "N/A"),
+                "impact": vuln.findtext("IMPACT", "N/A"),
+                "solution": vuln.findtext("SOLUTION", "N/A"),
+                "cve_id": vuln.findtext("CVE_LIST/CVE/ID", "N/A")
+            }
+            vulnerabilities.append(vuln_data)
+        
+        return vulnerabilities
+    except ET.ParseError as e:
+        print(f"Error parsing XML file: {e}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return []
+
+def main():
+    """Main function to process Qualys report and create Jira tickets."""
+    vulnerabilities = parse_qualys_report(QUALYS_REPORT_PATH)
+    if not vulnerabilities:
+        print("No vulnerabilities found or error parsing report.")
+        return
+
+    for vuln in vulnerabilities:
+        create_jira_issue(vuln)
+
+if __name__ == "__main__":
+    main()
